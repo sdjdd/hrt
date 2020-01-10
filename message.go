@@ -35,7 +35,11 @@ type (
 		Close string // explain whether and why the connection is closed
 		Data  []byte
 	}
-	OKMessage struct{}
+	OKMessage    struct{}
+	CloseMessage struct {
+		TID    string
+		Reason string
+	}
 )
 
 type MessageReader struct {
@@ -153,4 +157,13 @@ func (m DataMessage) Bytes() []byte {
 		Attr: attr,
 		Data: m.Data,
 	}.Bytes()
+}
+
+func (m *CloseMessage) Bytes() []byte {
+	data := make([]byte, len(m.Reason)+len("close")+2)
+	n := copy(data, []byte("close"))
+	data[n] = '\n'
+	n += copy(data, []byte(m.Reason))
+	data[n] = '\n'
+	return data
 }
