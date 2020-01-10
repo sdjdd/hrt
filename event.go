@@ -1,36 +1,58 @@
 package main
 
 type BrokerEvent struct {
-	Online  chan AgentInfo
-	Offline chan AgentInfo
-	Recv    chan BrokerMsgEvent
-	Send    chan BrokerMsgEvent
+	Online  chan *Agent
+	Offline chan *Agent
+	Recv    chan BrokerRecvMsgEvent
+	Send    chan BrokerSendMsgEvent
 	Request chan httpRequest
+
+	CreateTransferer chan CreateTransfererEvent
 }
 
 type AgentEvent struct {
-	RecvMsg chan Message
-	SendMsg chan Message
+	Connected chan struct{}
+	LostConn  chan error
+	RecvMsg   chan Transferable
+	SendMsg   chan Message
 }
 
-type BrokerMsgEvent struct {
+type BrokerRecvMsgEvent struct {
+	Agent *Agent
+	Msg   Transferable
+}
+
+type BrokerSendMsgEvent struct {
 	AgentID string
-	Msg     Message
+	Msg     Transferable
+}
+
+type CreateTransfererEvent struct {
+	Host     string
+	ResultCh chan<- Result
+}
+
+type Result struct {
+	Err error
+	Val interface{}
 }
 
 func NewBrokerEvent() *BrokerEvent {
 	return &BrokerEvent{
-		Online:  make(chan AgentInfo),
-		Offline: make(chan AgentInfo),
-		Recv:    make(chan BrokerMsgEvent, 16),
-		Send:    make(chan BrokerMsgEvent, 16),
-		Request: make(chan httpRequest),
+		Online:           make(chan *Agent),
+		Offline:          make(chan *Agent),
+		Recv:             make(chan BrokerRecvMsgEvent, 16),
+		Send:             make(chan BrokerSendMsgEvent, 16),
+		Request:          make(chan httpRequest),
+		CreateTransferer: make(chan CreateTransfererEvent),
 	}
 }
 
 func NewAgentEvent() *AgentEvent {
 	return &AgentEvent{
-		RecvMsg: make(chan Message),
-		SendMsg: make(chan Message),
+		Connected: make(chan struct{}),
+		LostConn:  make(chan error),
+		RecvMsg:   make(chan Transferable),
+		SendMsg:   make(chan Message),
 	}
 }

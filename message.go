@@ -11,24 +11,39 @@ import (
 )
 
 const (
-	MsgAuth = "AUTH"
-	MsgOK   = "OK"
-	MsgData = "DATA"
+	MsgAuth = "auth"
+	MsgOK   = "ok"
+	MsgData = "data"
 )
 
-type Message struct {
-	Type string
-	Attr map[string]string
-	Len  int
-	Data []byte
+type Transferable interface {
+	Bytes() []byte
 }
+
+type (
+	Message struct {
+		Type string
+		Attr map[string]string
+		Data []byte
+	}
+	AuthMessage struct {
+		Token, ID string
+	}
+	DataMessage struct {
+		TID   string
+		Host  string
+		Close string // explain whether and why the connection is closed
+		Data  []byte
+	}
+	OKMessage struct{}
+)
 
 type MessageReader struct {
 	rd *bufio.Reader
 }
 
 var (
-	ErrInvalidMessage = errors.New("Invalid Message")
+	ErrInvalidMessage = errors.New("invalid Message")
 )
 
 func NewMessageReader(rd io.Reader) *MessageReader {
@@ -37,42 +52,56 @@ func NewMessageReader(rd io.Reader) *MessageReader {
 	}
 }
 
-func (r *MessageReader) Read() (msg Message, err error) {
-	msg.Attr = make(map[string]string)
+func (r *MessageReader) Read() (msg Transferable, err error) {
+	attr := make(map[string]string)
 	for {
-		attr, er := r.rd.ReadBytes('\n')
+		line, er := r.rd.ReadBytes('\n')
 		if er != nil {
 			err = er
 			return
-		} else if len(attr) == 1 {
+		} else if len(line) == 1 {
 			break
 		}
 
-		kv := attr[:len(attr)-1]
-		if i := bytes.Index(kv, []byte{':'}); i > 0 {
-			msg.Attr[string(kv[:i])] = string(kv[i+1:])
+		if i := bytes.Index(line, []byte{':'}); i > 0 {
+			attr[string(line[:i])] = string(line[i+1 : len(line)-1])
 		} else {
 			err = ErrInvalidMessage
 			return
 		}
 	}
-	msg.Type = msg.Attr["type"]
-	delete(msg.Attr, "type")
 
-	dataLenStr, ok := msg.Attr["length"]
-	if !ok {
-		return
-	}
-	delete(msg.Attr, "length")
-
-	msg.Len, err = strconv.Atoi(dataLenStr)
-	if err != nil {
+	switch attr["type"] {
+	case "":
 		err = ErrInvalidMessage
 		return
+	case MsgAuth:
+		msg = AuthMessage{Token: attr["token"], ID: attr["id"]}
+		return
+	case MsgOK:
+		msg = OKMessage{}
+		return
+	case MsgData:
+		dataLen, ok := attr["length"]
+		if !ok {
+			err = ErrInvalidMessage
+			return
+		}
+		length, er := strconv.Atoi(dataLen)
+		if er != nil {
+			err = ErrInvalidMessage
+			return
+		}
+		data := make([]byte, length)
+		_, err = io.ReadFull(r.rd, data)
+		msg = DataMessage{
+			TID:   attr["tid"],
+			Host:  attr["host"],
+			Close: attr["close"],
+			Data:  data,
+		}
 	}
 
-	msg.Data = make([]byte, msg.Len)
-	_, err = io.ReadFull(r.rd, msg.Data)
 	return
 }
 
@@ -93,10 +122,35 @@ func (m Message) Bytes() []byte {
 func (m Message) String() string {
 	buf := new(strings.Builder)
 	buf.WriteString("type:" + m.Type + "\n")
-	fmt.Fprintf(buf, "length:%d\n", m.Len)
 	for k, v := range m.Attr {
 		buf.WriteString(k + ":" + v + "\n")
 	}
 	fmt.Fprintf(buf, "%v", m.Data)
 	return buf.String()
+}
+
+func (m AuthMessage) Bytes() []byte {
+	return Message{
+		Type: MsgAuth,
+		Attr: map[string]string{"token": m.Token, "id": m.ID},
+	}.Bytes()
+}
+
+func (m OKMessage) Bytes() []byte {
+	return []byte("type:ok\n\n")
+}
+
+func (m DataMessage) Bytes() []byte {
+	attr := map[string]string{"tid": m.TID}
+	if m.Host != "" {
+		attr["host"] = m.Host
+	}
+	if m.Close != "" {
+		attr["close"] = m.Close
+	}
+	return Message{
+		Type: MsgAuth,
+		Attr: attr,
+		Data: m.Data,
+	}.Bytes()
 }

@@ -21,7 +21,7 @@ func (c *Connection) Close() error {
 	return c.conn.Close()
 }
 
-func (c *Connection) ReadMessage(timeout time.Duration) (Message, error) {
+func (c *Connection) ReadMessage(timeout time.Duration) (Transferable, error) {
 	if timeout > 0 {
 		c.conn.SetReadDeadline(time.Now().Add(timeout))
 		defer c.conn.SetReadDeadline(time.Time{})

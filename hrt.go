@@ -35,16 +35,20 @@ func main() {
 
 func StartBroker() {
 	brk := NewBroker()
-	brk.Serve("127.0.0.1:8081", "127.0.0.1:80")
+	err := brk.Serve("127.0.0.1:8081", "127.0.0.1:80")
+	if err != nil {
+		log.Fatal("connect to broker: ", err)
+	}
 }
 
 func StartAgent() {
-	agent := NewAgent()
-	err := agent.Connect("127.0.0.1:8081")
-	if err != nil {
-		log.Error("connect to broker: ", err)
-		return
-	}
+	agent := NewAgent("gtmdc3p1")
+	go func() {
+		err := agent.Connect("127.0.0.1:8081", "")
+		if err != nil {
+			log.Error("connect to broker: ", err)
+			return
+		}
+	}()
 	agent.EventLoop()
-
 }

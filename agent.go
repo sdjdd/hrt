@@ -2,40 +2,74 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
+	"sync/atomic"
 	"time"
 )
 
 type Agent struct {
-	conn    *Connection
+	ID      string
+	conn    net.Conn
 	events  *AgentEvent
-	session map[string]net.Conn
+	tfs     map[string]io.ReadWriter
+	msgr    *MessageReader
+	nextTID uint64
 }
 
-func NewAgent() *Agent {
+func NewAgent(id string) *Agent {
 	return &Agent{
-		events:  NewAgentEvent(),
-		session: make(map[string]net.Conn),
+		ID:     id,
+		events: NewAgentEvent(),
+		tfs:    make(map[string]io.ReadWriter),
 	}
 }
 
-func (a *Agent) Connect(addr string) error {
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
-		return err
+// ReadMessage try to read a Message from Agent.conn.
+func (a *Agent) ReadMessage(timeout time.Duration) (Transferable, error) {
+	if timeout > 0 {
+		a.conn.SetReadDeadline(time.Now().Add(timeout))
+		defer a.conn.SetReadDeadline(time.Time{})
 	}
-	a.conn = NewConnection(conn)
+	return a.msgr.Read()
+}
 
-	if err = a.auth("", "test-agent"); err != nil {
-		log.Error("auth to broker:", err)
+func (a *Agent) SendMessage(msg Transferable) error {
+	_, err := a.conn.Write(msg.Bytes())
+	return err
+}
+
+func (a *Agent) SendOK() error {
+	_, err := a.conn.Write([]byte("type:ok\n\n"))
+	return err
+}
+
+func (a Agent) String() string {
+	id := a.ID
+	if id == "" {
+		id = "unknown"
+	}
+	return id + "@" + a.conn.RemoteAddr().String()
+}
+
+func (a *Agent) gentid() uint64 { return atomic.AddUint64(&a.nextTID, 1) }
+
+func (a *Agent) Connect(addr, token string) (err error) {
+	if a.conn, err = net.Dial("tcp", addr); err != nil {
+		return
+	}
+	a.msgr = NewMessageReader(a.conn)
+
+	if err = a.auth(token); err != nil {
+		return fmt.Errorf("auth to broker: %s", err)
 	}
 
-	go a.EventLoop()
 	go func() {
 		for {
-			msg, err := a.conn.ReadMessage(0)
+			msg, err := a.ReadMessage(0)
 			if err != nil {
 				log.Error("read message: ", err)
+				a.events.LostConn <- err
 				break
 			}
 			a.events.RecvMsg <- msg
@@ -43,23 +77,22 @@ func (a *Agent) Connect(addr string) error {
 		a.conn.Close()
 	}()
 
+	a.events.Connected <- struct{}{}
 	return nil
 }
 
-func (a *Agent) auth(token, id string) error {
-	msg := Message{
-		Type: MsgAuth,
-		Attr: map[string]string{"token": token, "id": id},
-	}
-	if err := a.conn.SendMessage(msg); err != nil {
+func (a *Agent) auth(token string) error {
+	err := a.SendMessage(AuthMessage{Token: token, ID: a.ID})
+	if err != nil {
 		return err
 	}
 
-	msg, err := a.conn.ReadMessage(time.Second * 10)
+	msg, err := a.ReadMessage(time.Second * 10)
 	if err != nil {
 		return err
-	} else if msg.Type != MsgOK {
-		return fmt.Errorf("expect OK message, got: %s", msg.Type)
+	}
+	if _, ok := msg.(OKMessage); !ok {
+		return fmt.Errorf("expect OK message")
 	}
 
 	return nil
@@ -68,52 +101,55 @@ func (a *Agent) auth(token, id string) error {
 func (a *Agent) EventLoop() {
 	for {
 		select {
+		case <-a.events.Connected:
+			log.Info("connect to broker successfully")
+		case err := <-a.events.LostConn:
+			log.Fatal("lost connection: ", err)
 		case msg := <-a.events.RecvMsg:
 			a.handleRecvMsg(msg)
 		case msg := <-a.events.SendMsg:
-			a.conn.SendMessage(msg)
+			a.SendMessage(msg)
 		}
 	}
 }
 
-func (a *Agent) handleRecvMsg(msg Message) {
-	switch msg.Type {
-	case MsgData:
-		serial := msg.Attr["serial"]
-		conn, ok := a.session[serial]
+func (a *Agent) handleRecvMsg(msg Transferable) {
+	switch m := msg.(type) {
+	case DataMessage:
+		conn, ok := a.tfs[m.TID]
 		if !ok {
 			var err error
-			conn, err = net.Dial("tcp", msg.Attr["host"])
+			conn, err = net.Dial("tcp", m.Host)
 			if err != nil {
-				log.Errorf("connect to %s: %s", msg.Attr["host"], err)
+				log.Errorf("connect to %s: %s", m.Host, err)
 				return
 			}
-			log.Info("dial to ", msg.Attr["host"])
-			a.session[serial] = conn
+			log.Info("dial to ", m.Host)
+			a.tfs[m.TID] = conn
 			go func() {
 				buf := make([]byte, 16*1024)
 				for {
 					n, err := conn.Read(buf)
 					if err != nil {
+						if err == io.EOF {
+							log.Infof("connection to %s closed", m.Host)
+						} else {
+							log.Infof("connection to %s unexpectedly closed", m.Host)
+						}
 						break
 					}
 					data := make([]byte, n)
 					copy(data, buf)
-					log.Info("receive: ", string(data))
 					a.events.SendMsg <- Message{
 						Type: MsgData,
-						Len:  n,
 						Data: data,
-						Attr: map[string]string{
-							"serial": serial,
-						},
+						Attr: map[string]string{"tid": m.TID},
 					}
 				}
 			}()
 		}
-		log.Info("send: ", string(msg.Data))
-		conn.Write(msg.Data)
+		conn.Write(m.Data)
 	default:
-		log.Error("unsupported message type: ", msg.Type)
+		log.Error("received an unsupported message type")
 	}
 }

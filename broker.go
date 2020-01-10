@@ -13,17 +13,11 @@ import (
 
 type (
 	Broker struct {
-		route   map[string]RouteInfo
-		agents  map[string]AgentInfo
-		events  *BrokerEvent
-		serial  uint64
-		session map[string]*RequestTransferer
+		route  map[string]RouteInfo
+		agents map[string]*Agent
+		events *BrokerEvent
 
 		Token string
-	}
-	AgentInfo struct {
-		ID   string
-		Conn *Connection
 	}
 	RouteInfo struct {
 		AgentID, Host string
@@ -32,30 +26,37 @@ type (
 		*http.Request
 		Conn net.Conn
 	}
+	HttpError struct {
+		Status  int
+		Msg     string
+		Content string
+	}
 )
+
+func (e HttpError) Error() string { return e.Content }
 
 func NewBroker() *Broker {
 	return &Broker{
 		route: map[string]RouteInfo{
-			"127.0.0.1": {"test-agent", "www.baidu.com:80"},
-			"hrt.test":  {"test-agent", "127.0.0.1:9001"},
+			"127.0.0.1": {"gtmdc3p1", "www.baidu.com:80"},
+			"hrt.test":  {"gtmdc3p1", "tjjlmd.com:80"},
 		},
-		agents:  make(map[string]AgentInfo),
-		events:  NewBrokerEvent(),
-		session: make(map[string]*RequestTransferer),
+		agents: make(map[string]*Agent),
+		events: NewBrokerEvent(),
 	}
 }
 
-func SendHTTPError(conn net.Conn, status int, format string, a ...interface{}) {
-	msg := fmt.Sprintf("hrt error: "+format, a...)
+func SendHTTPError(conn net.Conn, err HttpError) {
+	msg := "hrt error: " + err.Content
 	bufw := bufio.NewWriter(conn)
-	fmt.Fprintf(bufw, "HTTP/1.1 %d \r\n", status)
+	fmt.Fprintf(bufw, "HTTP/1.1 %d %s\r\n", err.Status, err.Msg)
 	fmt.Fprintf(bufw, "Content-Length: %d\r\n", len(msg))
 	bufw.WriteString("\r\n")
 	bufw.WriteString(msg)
 	bufw.Flush()
 	conn.Close()
 }
+
 func (b *Broker) Serve(addr, httpAddr string) (err error) {
 	lsn, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -70,10 +71,16 @@ func (b *Broker) Serve(addr, httpAddr string) (err error) {
 	for {
 		conn, er := lsn.Accept()
 		if er != nil {
-			err = fmt.Errorf("accept agent: %w", er)
+			err = fmt.Errorf("accept agent: %s", er)
 			break
 		}
-		go b.auth(NewConnection(conn))
+
+		agent := &Agent{
+			conn: conn,
+			msgr: NewMessageReader(conn),
+			tfs:  make(map[string]io.ReadWriter),
+		}
+		go b.auth(agent)
 	}
 	lsn.Close()
 	cancel()
@@ -81,36 +88,39 @@ func (b *Broker) Serve(addr, httpAddr string) (err error) {
 	return
 }
 
-func (b *Broker) auth(conn *Connection) {
+func (b *Broker) auth(agent *Agent) {
 	var err error
 	defer func() {
 		if err != nil {
-			log.Error("auth agent: ", err)
-			conn.Close()
+			log.Errorf("auth agent %s: %s", agent, err)
+			agent.conn.Close()
 		}
 	}()
 
-	msg, err := conn.ReadMessage(time.Second * 10)
+	msg, err := agent.ReadMessage(time.Second * 10)
 	if err != nil {
-		return
-	} else if msg.Type != MsgAuth {
-		err = fmt.Errorf("first message from %s is not AUTH", conn)
-		return
-	} else if msg.Attr["token"] != b.Token {
-		err = fmt.Errorf("invalid token from %s", conn)
 		return
 	}
 
-	id := msg.Attr["id"]
-	if id == "" {
-		err = fmt.Errorf("empty id from %s", conn)
+	m, ok := msg.(AuthMessage)
+	if !ok {
+		err = fmt.Errorf("first message from %s is not AUTH", agent)
 		return
-	} else if err = conn.SendOK(); err != nil {
+	} else if m.Token != b.Token {
+		err = fmt.Errorf("invalid token from %s", agent)
+		return
+	}
+
+	if agent.ID = m.ID; agent.ID == "" {
+		err = fmt.Errorf("empty id from %s", agent)
+		return
+	}
+	if err = agent.SendOK(); err != nil {
 		err = fmt.Errorf("send OK message: %s", err)
 		return
 	}
 
-	b.events.Online <- AgentInfo{id, conn}
+	b.events.Online <- agent
 }
 
 func (b *Broker) EventLoop(ctx context.Context) {
@@ -121,77 +131,53 @@ func (b *Broker) EventLoop(ctx context.Context) {
 
 		case agent := <-b.events.Online:
 			if _, ok := b.agents[agent.ID]; ok {
-				agent.Conn.Close()
 				log.Errorf("agent id %s already exists", agent.ID)
+				agent.conn.Close()
 			} else {
+				log.Infof("agent %s online", agent)
 				b.agents[agent.ID] = agent
 				go b.HandleAgent(agent)
-				log.Infof("agent %s@%s online", agent.ID, agent.Conn)
 			}
 
 		case e := <-b.events.Recv:
-			rt, ok := b.session[e.Msg.Attr["serial"]]
-			if !ok {
-				log.Error("request not exists")
-				return
+			switch m := e.Msg.(type) {
+			case DataMessage:
+				if tf, ok := e.Agent.tfs[m.TID]; ok {
+					tf.(*Transferer).rch <- m.Data
+				} else {
+					log.Errorf("transferer %s has been closed", m.TID)
+				}
 			}
-			rt.rch <- e.Msg.Data
-			log.Info("receive: ", string(e.Msg.Data))
 
 		case e := <-b.events.Send:
-			agent, ok := b.agents[e.AgentID]
-			if !ok {
+			if agent, ok := b.agents[e.AgentID]; ok {
+				agent.SendMessage(e.Msg)
+			} else {
 				log.Error("agent is offline")
-				continue
 			}
-			agent.Conn.SendMessage(e.Msg)
 
 		case agent := <-b.events.Offline:
-			agent.Conn.Close()
+			agent.conn.Close()
 			delete(b.agents, agent.ID)
-			log.Infof("agent %s@%s offline", agent.ID, agent.Conn)
+			log.Infof("agent %s offline", agent)
 
-		case req := <-b.events.Request:
-			route, ok := b.route[req.Host]
-			if !ok {
-				SendHTTPError(req.Conn, 404, "no route record for this host")
-				continue
-			}
-			_, ok = b.agents[route.AgentID]
-			if !ok {
-				SendHTTPError(req.Conn, 503, "agent for this host is offline")
-				continue
-			}
-			serialstr := strconv.FormatUint(b.serial, 32)
-			b.serial++
-
-			reqw := b.NewRequestTransferer(serialstr, route.AgentID, route.Host)
-			b.session[serialstr] = reqw
-			req.Host = route.Host
-			go func() {
-				req.Write(reqw)
-				reqw.Flush()
-				log.Info("start to read resp")
-				resp, err := http.ReadResponse(bufio.NewReader(reqw), req.Request)
-				if err != nil {
-					log.Error("read http response: ", err)
-					return
-				}
-
-				resp.Write(req.Conn)
-				req.Conn.Close()
-			}()
+		case e := <-b.events.CreateTransferer:
+			b.handleCreateTrensferer(e)
 		}
 	}
 }
 
-func (b *Broker) HandleAgent(agent AgentInfo) {
+func (b *Broker) SendToAgent(agentID string, msg Transferable) {
+	b.events.Send <- BrokerSendMsgEvent{agentID, msg}
+}
+
+func (b *Broker) HandleAgent(agent *Agent) {
 	for {
-		msg, err := agent.Conn.ReadMessage(0)
+		msg, err := agent.ReadMessage(0)
 		if err != nil {
 			break
 		}
-		b.events.Recv <- BrokerMsgEvent{agent.ID, msg}
+		b.events.Recv <- BrokerRecvMsgEvent{agent, msg}
 	}
 	b.events.Offline <- agent
 }
@@ -214,74 +200,135 @@ func (b *Broker) ServeHTTP(addr string) {
 }
 
 func (b *Broker) handleHTTPRequest(conn net.Conn) {
-	req, err := http.ReadRequest(bufio.NewReader(conn))
-	if err != nil {
-		log.Error("read http request: ", err)
+	defer conn.Close()
+	remote := conn.RemoteAddr().String()
+	log.Debug("new http request come: ", remote)
+
+	reqbuf := bufio.NewReader(conn)
+	var reqHost string
+	var tf io.ReadWriteCloser
+	var respbuf *bufio.Reader
+	for {
+		req, err := http.ReadRequest(reqbuf)
+		if err != nil {
+			if err == io.EOF {
+				log.Debug("http request read finish: ", remote)
+			} else {
+				log.Errorf("read http request from %s: %s", remote, err)
+			}
+			break
+		}
+
+		if tf == nil {
+			if reqHost = req.Host; req.Host == "" {
+				SendHTTPError(conn, HttpError{400, "Bad Request", "missing host request header"})
+				break
+			}
+
+			if t, err := b.CreateTransferer(req.Host); err != nil {
+				switch er := err.(type) {
+				case HttpError:
+					SendHTTPError(conn, er)
+				default:
+					log.Error(er)
+				}
+				break
+			} else {
+				tf = t
+				respbuf = bufio.NewReader(tf)
+			}
+		} else if req.Host != reqHost {
+			log.Error("request different hosts on the same TCP connection")
+			break
+		}
+
+		req.Host = tf.(*Transferer).host
+		req.Write(tf)
+		resp, err := http.ReadResponse(respbuf, req)
+		if err != nil {
+			log.Error(err)
+			break
+		}
+		resp.Write(conn)
+	}
+	if tf != nil {
+		tf.Close()
+	}
+}
+
+func (b *Broker) handleCreateTrensferer(e CreateTransfererEvent) {
+	var result Result
+	defer func() {
+		e.ResultCh <- result
+		close(e.ResultCh)
+	}()
+
+	route, ok := b.route[e.Host]
+	if !ok {
+		result.Err = HttpError{404, "Not Found", "no route record for this host"}
 		return
 	}
-	b.events.Request <- httpRequest{req, conn}
-}
-
-func (b *Broker) NewRequestTransferer(serial, agentID, host string) *RequestTransferer {
-	return &RequestTransferer{
-		wch:     b.events.Send,
-		rch:     make(chan []byte),
-		buf:     make([]byte, 16*1024),
-		Serial:  serial,
-		AgentID: agentID,
-		Host:    host,
+	agent, ok := b.agents[route.AgentID]
+	if !ok {
+		result.Err = HttpError{503, "Agent Offline", "agent for this host is offline"}
+		return
 	}
+
+	tid := strconv.FormatUint(agent.gentid(), 10)
+	tf := NewTransferer(tid, agent.ID, route.Host)
+	tf.wch = b.events.Send
+	agent.tfs[tid] = tf
+	result.Val = tf
 }
 
-func (b *Broker) CloseRequestTransferer(rt *RequestTransferer) {
-
+func (b *Broker) CreateTransferer(host string) (tf io.ReadWriteCloser, err error) {
+	retch := make(chan Result)
+	b.events.CreateTransferer <- CreateTransfererEvent{host, retch}
+	result := <-retch
+	if result.Err == nil {
+		tf = result.Val.(io.ReadWriteCloser)
+	} else {
+		err = result.Err
+	}
+	return
 }
 
-type RequestTransferer struct {
-	wch      chan BrokerMsgEvent
+type Transferer struct {
+	id       string
+	host     string
+	agentID  string
+	wch      chan BrokerSendMsgEvent
 	rch      chan []byte
-	buf      []byte
-	wp       int
 	lastRead []byte
 
-	Serial  string
-	AgentID string
-	Host    string
+	OnClose func(id string)
 }
 
-func (w *RequestTransferer) Write(p []byte) (n int, err error) {
-	var rp int
-	for rp < len(p) {
-		copied := copy(w.buf[w.wp:], p[rp:])
-		w.wp += copied
-		rp += copied
-		if w.wp == len(w.buf) {
-			w.Flush()
-		}
+func NewTransferer(id, agentID, host string) *Transferer {
+	return &Transferer{
+		id:      id,
+		host:    host,
+		agentID: agentID,
+		rch:     make(chan []byte),
 	}
-	return len(p), nil
 }
 
-func (w *RequestTransferer) Flush() error {
-	data := append(w.buf[:0:0], w.buf[:w.wp]...)
+func (t *Transferer) Write(p []byte) (n int, err error) {
+	data := make([]byte, len(p))
+	n = copy(data, p)
 	msg := Message{
 		Type: MsgData,
-		Len:  w.wp,
 		Data: data,
 		Attr: map[string]string{
-			"serial": w.Serial,
-			"host":   w.Host,
+			"tid":  t.id,
+			"host": t.host,
 		},
 	}
-	w.wch <- BrokerMsgEvent{
-		AgentID: w.AgentID,
-		Msg:     msg,
-	}
-	w.wp = 0
-	return nil
+	t.wch <- BrokerSendMsgEvent{t.agentID, msg}
+	return
 }
 
-func (r *RequestTransferer) Read(p []byte) (n int, err error) {
+func (r *Transferer) Read(p []byte) (n int, err error) {
 	var data []byte
 	if r.lastRead == nil {
 		var ok bool
@@ -298,4 +345,19 @@ func (r *RequestTransferer) Read(p []byte) (n int, err error) {
 	}
 	n = copy(p, data)
 	return
+}
+
+func (t *Transferer) Close() error {
+	msg := Message{
+		Type: MsgData,
+		Attr: map[string]string{
+			"tid":   t.id,
+			"close": "EOF",
+		},
+	}
+	t.wch <- BrokerSendMsgEvent{t.agentID, msg}
+	if t.OnClose != nil {
+		t.OnClose(t.id)
+	}
+	return nil
 }
