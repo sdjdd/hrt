@@ -7,9 +7,34 @@ import (
 	"go.uber.org/zap"
 )
 
+type (
+	BrokerConf struct {
+		listen string
+		http   string
+		route  string
+		token  string
+	}
+	AgentConf struct {
+		addr  string
+		token string
+		id    string
+	}
+)
+
 var log *zap.SugaredLogger
 
+// var exit = make(chan struct{})
+
 func init() {
+	// exch := make(chan os.Signal, 1)
+	// go func() {
+	// 	<-exch
+	// 	signal.Stop(exch)
+	// 	close(exch)
+	// 	close(exit)
+	// }()
+	// signal.Notify(exch, syscall.SIGINT)
+
 	logger, err := zap.NewDevelopment()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "initialize logger failed: %s", err)
@@ -19,36 +44,39 @@ func init() {
 }
 
 func main() {
-
-	if len(os.Args) != 2 {
-		fmt.Fprintf(os.Stderr, "usage:\n  hrt [command]\n")
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-
-	switch cmd := os.Args[1]; cmd {
-	case "serve":
-		StartBroker()
-	case "connect":
-		StartAgent()
-	}
 }
 
-func StartBroker() {
-	brk := NewBroker()
-	err := brk.Serve("127.0.0.1:8081", "127.0.0.1:80")
-	if err != nil {
-		log.Fatal("connect to broker: ", err)
-	}
-}
+func StartBroker(conf BrokerConf) {
+	b := Broker{Token: conf.token}
+	b.Init()
 
-func StartAgent() {
-	agent := NewAgent("gtmdc3p1")
-	go func() {
-		err := agent.Connect("127.0.0.1:8081", "")
+	if conf.route != "" {
+		route, err := ReadJsonRoute(conf.route)
 		if err != nil {
-			log.Error("connect to broker: ", err)
-			return
+			log.Fatal("read route file: ", err)
 		}
-	}()
-	agent.EventLoop()
+		b.route = route
+		log.Info("successfully loaded the routing information from ", conf.route)
+		for host, record := range route {
+			log.Debugf("route: %s => %s[%s]", host, record.AgentID, record.Host)
+		}
+	}
+
+	err := b.Serve(conf.listen, conf.http)
+	if err != nil {
+		log.Error("start broker: ", err)
+	}
+}
+
+func StartAgent(conf AgentConf) {
+	agent := NewAgent(conf.id)
+	err := agent.Connect(conf.addr, conf.token)
+	if err != nil {
+		log.Error("connect to broker: ", err)
+		return
+	}
 }

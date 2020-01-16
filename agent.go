@@ -1,8 +1,8 @@
 package main
 
 import (
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync/atomic"
 	"time"
@@ -11,21 +11,43 @@ import (
 type Agent struct {
 	ID      string
 	conn    net.Conn
-	events  *AgentEvent
-	tfs     map[string]io.ReadWriter
+	ev      AgentEvent
+	tfs     map[string]Transferer
+	lcons   map[string]net.Conn
 	msgr    *MessageReader
 	nextTID uint64
 }
 
-func NewAgent(id string) *Agent {
-	return &Agent{
-		ID:     id,
-		events: NewAgentEvent(),
-		tfs:    make(map[string]io.ReadWriter),
-	}
+type AgentEvent struct {
+	GetLocalConn    chan AE_GetLocalConn
+	CloseLocalConn  chan AE_CloseLocalConn
+	DispatchRequest chan DataMessage
 }
 
-// ReadMessage try to read a Message from Agent.conn.
+type (
+	AE_GetLocalConn struct {
+		TID    string
+		Host   string
+		Future *Future
+	}
+	AE_CloseLocalConn struct {
+		TID, Host string
+		Err       error
+	}
+)
+
+func NewAgent(id string) *Agent {
+	a := &Agent{
+		ID:    id,
+		tfs:   make(map[string]Transferer),
+		lcons: make(map[string]net.Conn),
+	}
+	a.ev.GetLocalConn = make(chan AE_GetLocalConn)
+	a.ev.CloseLocalConn = make(chan AE_CloseLocalConn)
+	a.ev.DispatchRequest = make(chan DataMessage)
+	return a
+}
+
 func (a *Agent) ReadMessage(timeout time.Duration) (Transferable, error) {
 	if timeout > 0 {
 		a.conn.SetReadDeadline(time.Now().Add(timeout))
@@ -39,11 +61,6 @@ func (a *Agent) SendMessage(msg Transferable) error {
 	return err
 }
 
-func (a *Agent) SendOK() error {
-	_, err := a.conn.Write([]byte("type:ok\n\n"))
-	return err
-}
-
 func (a Agent) String() string {
 	id := a.ID
 	if id == "" {
@@ -52,32 +69,52 @@ func (a Agent) String() string {
 	return id + "@" + a.conn.RemoteAddr().String()
 }
 
-func (a *Agent) gentid() uint64 { return atomic.AddUint64(&a.nextTID, 1) }
+func (a *Agent) gentid() uint64 {
+	return atomic.AddUint64(&a.nextTID, 1)
+}
 
 func (a *Agent) Connect(addr, token string) (err error) {
 	if a.conn, err = net.Dial("tcp", addr); err != nil {
 		return
 	}
+	defer a.conn.Close()
 	a.msgr = NewMessageReader(a.conn)
 
 	if err = a.auth(token); err != nil {
 		return fmt.Errorf("auth to broker: %s", err)
 	}
 
-	go func() {
-		for {
-			msg, err := a.ReadMessage(0)
-			if err != nil {
-				log.Error("read message: ", err)
-				a.events.LostConn <- err
-				break
-			}
-			a.events.RecvMsg <- msg
-		}
-		a.conn.Close()
-	}()
+	log.Info("connect to broker successfully")
+	go a.handleRecvMsg()
 
-	a.events.Connected <- struct{}{}
+	for {
+		select {
+		case e := <-a.ev.GetLocalConn:
+			a.eh_GetLocalConn(e)
+
+			// case m := <-a.ev.DispatchRequest:
+			// 	var tf Transferer
+			// 	if m.Serial == 0 {
+			// 		tf = NewTransferer()
+			// 		a.tfs[m.TID] = tf
+			// 		go func() {
+			// 			tf.
+			// 		}()
+			// 	} else {
+			// 		var ok bool
+			// 		tf, ok = a.tfs[m.TID]
+			// 		if !ok {
+			// 			a.SendMessage(CloseMessage{
+			// 				TID:    m.TID,
+			// 				Reason: "EOF",
+			// 			})
+			// 			continue
+			// 		}
+			// 	}
+			// 	tf.Request.Write(m.Data)
+		}
+	}
+
 	return nil
 }
 
@@ -91,65 +128,110 @@ func (a *Agent) auth(token string) error {
 	if err != nil {
 		return err
 	}
-	if _, ok := msg.(OKMessage); !ok {
-		return fmt.Errorf("expect OK message")
+
+	switch m := msg.(type) {
+	case TextMessage:
+		if m.Content != "OK" {
+			return errors.New(m.Content)
+		}
+	case ErrorMessage:
+		return errors.New(m.Content)
 	}
 
 	return nil
 }
 
-func (a *Agent) EventLoop() {
+func (a *Agent) handleRecvMsg() {
 	for {
-		select {
-		case <-a.events.Connected:
-			log.Info("connect to broker successfully")
-		case err := <-a.events.LostConn:
-			log.Fatal("lost connection: ", err)
-		case msg := <-a.events.RecvMsg:
-			a.handleRecvMsg(msg)
-		case msg := <-a.events.SendMsg:
-			a.SendMessage(msg)
+		msg, err := a.ReadMessage(0)
+		if err != nil {
+			break
+		}
+		switch m := msg.(type) {
+		case TextMessage:
+			log.Info("message from broker: ", m.Content)
+
+		case DataMessage:
+			log.Debugf("recv data msg, host=%s, tid=%s, data=%s", m.Host, m.TID, string(m.Data))
+			if m.Serial == 0 {
+				_, err := a.getLocalConn(m.Host, m.TID)
+				if err != nil {
+					log.Errorf("get local connection: %s", err)
+					a.SendMessage(CloseMessage{TID: m.TID, Reason: "EOF"})
+					continue
+				}
+
+			}
+
+		default:
+
 		}
 	}
 }
 
-func (a *Agent) handleRecvMsg(msg Transferable) {
-	switch m := msg.(type) {
-	case DataMessage:
-		conn, ok := a.tfs[m.TID]
-		if !ok {
-			var err error
-			conn, err = net.Dial("tcp", m.Host)
-			if err != nil {
-				log.Errorf("connect to %s: %s", m.Host, err)
-				return
-			}
-			log.Info("dial to ", m.Host)
-			a.tfs[m.TID] = conn
-			go func() {
-				buf := make([]byte, 16*1024)
-				for {
-					n, err := conn.Read(buf)
-					if err != nil {
-						if err == io.EOF {
-							log.Infof("connection to %s closed", m.Host)
-						} else {
-							log.Infof("connection to %s unexpectedly closed", m.Host)
-						}
-						break
-					}
-					data := make([]byte, n)
-					copy(data, buf)
-					a.events.SendMsg <- Message{
-						Type: MsgData,
-						Data: data,
-						Attr: map[string]string{"tid": m.TID},
-					}
-				}
-			}()
-		}
-		conn.Write(m.Data)
-	default:
-		log.Error("received an unsupported message type")
+func (a *Agent) getLocalConn(host, tid string) (conn net.Conn, err error) {
+	future := NewFuture()
+	a.ev.GetLocalConn <- AE_GetLocalConn{
+		TID:    tid,
+		Host:   host,
+		Future: future,
 	}
+	val, err := future.Result()
+	if err == nil {
+		conn = val.(net.Conn)
+	}
+	return
+}
+
+func (a *Agent) Close() error {
+	return nil
+}
+
+func (a *Agent) eh_GetLocalConn(e AE_GetLocalConn) {
+	s := e.TID + e.Host
+	conn, ok := a.lcons[s]
+	if ok {
+		e.Future.Resolve(conn)
+		return
+	}
+
+	conn, err := net.Dial("tcp", e.Host)
+	if err != nil {
+		log.Debugf("fail to create local connection to %s: %s", e.Host, err)
+		e.Future.Reject(err)
+		return
+	}
+	a.lcons[s] = conn
+	e.Future.Resolve(conn)
+	log.Debugf("local connection to %s created", e.Host)
+
+	go func() {
+		buf := make([]byte, 16*1024)
+		for serial := 0; ; serial++ {
+			n, err := conn.Read(buf)
+			if err != nil {
+				log.Error("read data from local connection: ", err)
+				break
+			}
+
+			a.SendMessage(DataMessage{
+				Serial: serial,
+				TID:    e.TID,
+				Host:   e.Host,
+				Data:   buf[:n],
+			})
+		}
+		a.SendMessage(CloseMessage{TID: e.TID, Reason: "EOF"})
+		a.ev.CloseLocalConn <- AE_CloseLocalConn{TID: e.TID, Host: e.Host}
+	}()
+}
+
+func (a *Agent) eh_CloseLocalConn(tid, host string) {
+	s := tid + host
+	conn, ok := a.lcons[s]
+	if !ok {
+		return
+	}
+	conn.Close()
+	delete(a.lcons, s)
 }

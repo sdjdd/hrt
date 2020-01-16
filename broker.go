@@ -2,9 +2,8 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -13,79 +12,80 @@ import (
 
 type (
 	Broker struct {
-		route  map[string]RouteInfo
+		route  Route
 		agents map[string]*Agent
-		events *BrokerEvent
+		ev     BrokerEvent
+		done   <-chan struct{}
 
 		Token string
 	}
-	RouteInfo struct {
-		AgentID, Host string
-	}
-	httpRequest struct {
-		*http.Request
-		Conn net.Conn
-	}
-	HttpError struct {
-		Status  int
-		Msg     string
-		Content string
-	}
 )
 
-func (e HttpError) Error() string { return e.Content }
-
-func NewBroker() *Broker {
-	return &Broker{
-		route: map[string]RouteInfo{
-			"127.0.0.1": {"gtmdc3p1", "www.baidu.com:80"},
-			"hrt.test":  {"gtmdc3p1", "tjjlmd.com:80"},
-		},
-		agents: make(map[string]*Agent),
-		events: NewBrokerEvent(),
-	}
+type BrokerEvent struct {
+	AgentOnline      chan *Agent
+	AgentOffline     chan *Agent
+	CreateTransferer chan BrokerEvCreateTransferer
+	DispatchRequest  chan BEvDispatchMessage
+	DispatchResponse chan BEvDispatchMessage
 }
 
-func SendHTTPError(conn net.Conn, err HttpError) {
-	msg := "hrt error: " + err.Content
-	bufw := bufio.NewWriter(conn)
-	fmt.Fprintf(bufw, "HTTP/1.1 %d %s\r\n", err.Status, err.Msg)
-	fmt.Fprintf(bufw, "Content-Length: %d\r\n", len(msg))
-	bufw.WriteString("\r\n")
-	bufw.WriteString(msg)
-	bufw.Flush()
-	conn.Close()
+type BrokerEvCreateTransferer struct {
+	Host   string
+	future *Future
+}
+
+type BEvDispatchMessage struct {
+	Agent *Agent
+	Msg   DataMessage
+}
+
+func (e *BrokerEvent) Init() {
+	e.AgentOnline = make(chan *Agent)
+	e.AgentOffline = make(chan *Agent)
+	e.CreateTransferer = make(chan BrokerEvCreateTransferer)
+	e.DispatchRequest = make(chan BEvDispatchMessage)
+	e.DispatchResponse = make(chan BEvDispatchMessage)
+}
+
+func (b *Broker) Init() {
+	b.agents = make(map[string]*Agent)
+	b.ev.Init()
 }
 
 func (b *Broker) Serve(addr, httpAddr string) (err error) {
-	lsn, err := net.Listen("tcp", addr)
+	agentListener, err := net.Listen("tcp", addr)
 	if err != nil {
-		return
+		return fmt.Errorf("start broker: %s", err)
 	}
-	log.Info("hrt broker listen on ", lsn.Addr())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go b.EventLoop(ctx)
-	go b.ServeHTTP(httpAddr)
+	httpListener, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		return fmt.Errorf("start http service: %s", err)
+	}
+
+	go b.acceptAgent(agentListener)
+	go b.acceptHTTPRequest(httpListener)
+
+	log.Info("hrt broker listen on ", agentListener.Addr())
 
 	for {
-		conn, er := lsn.Accept()
-		if er != nil {
-			err = fmt.Errorf("accept agent: %s", er)
-			break
+		select {
+		case <-b.done:
+			agentListener.Close()
+			httpListener.Close()
+			return
+		case agent := <-b.ev.AgentOnline:
+			b.eh_AgentOnline(agent)
+		case agent := <-b.ev.AgentOffline:
+			b.eh_AgentOffline(agent)
+		case e := <-b.ev.CreateTransferer:
+			b.eh_CreateTransferer(e)
+		case e := <-b.ev.DispatchRequest:
+			b.eh_DispatchRequest(e)
+		case e := <-b.ev.DispatchResponse:
+			b.eh_DispatchResponse(e)
 		}
-
-		agent := &Agent{
-			conn: conn,
-			msgr: NewMessageReader(conn),
-			tfs:  make(map[string]io.ReadWriter),
-		}
-		go b.auth(agent)
 	}
-	lsn.Close()
-	cancel()
-
-	return
 }
 
 func (b *Broker) auth(agent *Agent) {
@@ -104,260 +104,193 @@ func (b *Broker) auth(agent *Agent) {
 
 	m, ok := msg.(AuthMessage)
 	if !ok {
-		err = fmt.Errorf("first message from %s is not AUTH", agent)
+		err = errors.New("received a non-auth message")
 		return
-	} else if m.Token != b.Token {
-		err = fmt.Errorf("invalid token from %s", agent)
+	}
+	if agent.ID = m.ID; agent.ID == "" {
+		err = errors.New("id is empty")
+		return
+	}
+	if m.Token != b.Token {
+		err = errors.New("token is not correct")
 		return
 	}
 
-	if agent.ID = m.ID; agent.ID == "" {
-		err = fmt.Errorf("empty id from %s", agent)
-		return
-	}
-	if err = agent.SendOK(); err != nil {
+	err = agent.SendMessage(TextMessage{Content: "OK"})
+	if err != nil {
 		err = fmt.Errorf("send OK message: %s", err)
 		return
 	}
 
-	b.events.Online <- agent
+	b.ev.AgentOnline <- agent
 }
 
-func (b *Broker) EventLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case agent := <-b.events.Online:
-			if _, ok := b.agents[agent.ID]; ok {
-				log.Errorf("agent id %s already exists", agent.ID)
-				agent.conn.Close()
-			} else {
-				log.Infof("agent %s online", agent)
-				b.agents[agent.ID] = agent
-				go b.HandleAgent(agent)
-			}
-
-		case e := <-b.events.Recv:
-			switch m := e.Msg.(type) {
-			case DataMessage:
-				if tf, ok := e.Agent.tfs[m.TID]; ok {
-					tf.(*Transferer).rch <- m.Data
-				} else {
-					log.Errorf("transferer %s has been closed", m.TID)
-				}
-			}
-
-		case e := <-b.events.Send:
-			if agent, ok := b.agents[e.AgentID]; ok {
-				agent.SendMessage(e.Msg)
-			} else {
-				log.Error("agent is offline")
-			}
-
-		case agent := <-b.events.Offline:
-			agent.conn.Close()
-			delete(b.agents, agent.ID)
-			log.Infof("agent %s offline", agent)
-
-		case e := <-b.events.CreateTransferer:
-			b.handleCreateTrensferer(e)
-		}
-	}
-}
-
-func (b *Broker) SendToAgent(agentID string, msg Transferable) {
-	b.events.Send <- BrokerSendMsgEvent{agentID, msg}
-}
-
-func (b *Broker) HandleAgent(agent *Agent) {
+func (b *Broker) recvAgentMessage(agent *Agent) {
 	for {
 		msg, err := agent.ReadMessage(0)
 		if err != nil {
 			break
 		}
-		b.events.Recv <- BrokerRecvMsgEvent{agent, msg}
+
+		switch m := msg.(type) {
+		case DataMessage:
+			b.ev.DispatchResponse <- BEvDispatchMessage{
+				Agent: agent,
+				Msg:   m,
+			}
+		case TextMessage:
+			log.Debugf("text message from %s: %s", agent, m.Content)
+		case ErrorMessage:
+			log.Debugf("error message from %s: %s", agent, m.Content)
+		case CloseMessage:
+			log.Debugf("transferer %s closed: %s", m.TID, m.Reason)
+		default:
+			log.Infof("received a unknown message from %s", agent)
+		}
 	}
-	b.events.Offline <- agent
+
+	b.ev.AgentOffline <- agent
 }
 
-func (b *Broker) ServeHTTP(addr string) {
-	lsn, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Error("start http service: ", err)
+func (b *Broker) eh_AgentOnline(agent *Agent) {
+	log.Infof("agent %s online", agent)
+	b.agents[agent.ID] = agent
+	go b.recvAgentMessage(agent)
+}
+
+func (b *Broker) eh_AgentOffline(agent *Agent) {
+	log.Infof("agent %s offline", agent)
+	delete(b.agents, agent.ID)
+}
+
+func (b *Broker) eh_DispatchRequest(e BEvDispatchMessage) {
+
+}
+
+func (b *Broker) eh_DispatchResponse(e BEvDispatchMessage) {
+	tf, ok := e.Agent.tfs[e.Msg.TID]
+	if !ok {
 		return
 	}
-	for {
-		conn, err := lsn.Accept()
-		if err != nil {
-			log.Error("accept http connection: ", err)
-			break
-		}
-		go b.handleHTTPRequest(conn)
-	}
-	lsn.Close()
+	tf.Response.Write(e.Msg.Data)
 }
 
-func (b *Broker) handleHTTPRequest(conn net.Conn) {
-	defer conn.Close()
-	remote := conn.RemoteAddr().String()
-	log.Debug("new http request come: ", remote)
-
-	reqbuf := bufio.NewReader(conn)
-	var reqHost string
-	var tf io.ReadWriteCloser
-	var respbuf *bufio.Reader
-	for {
-		req, err := http.ReadRequest(reqbuf)
-		if err != nil {
-			if err == io.EOF {
-				log.Debug("http request read finish: ", remote)
-			} else {
-				log.Errorf("read http request from %s: %s", remote, err)
-			}
-			break
-		}
-
-		if tf == nil {
-			if reqHost = req.Host; req.Host == "" {
-				SendHTTPError(conn, HttpError{400, "Bad Request", "missing host request header"})
-				break
-			}
-
-			if t, err := b.CreateTransferer(req.Host); err != nil {
-				switch er := err.(type) {
-				case HttpError:
-					SendHTTPError(conn, er)
-				default:
-					log.Error(er)
-				}
-				break
-			} else {
-				tf = t
-				respbuf = bufio.NewReader(tf)
-			}
-		} else if req.Host != reqHost {
-			log.Error("request different hosts on the same TCP connection")
-			break
-		}
-
-		req.Host = tf.(*Transferer).host
-		req.Write(tf)
-		resp, err := http.ReadResponse(respbuf, req)
-		if err != nil {
-			log.Error(err)
-			break
-		}
-		resp.Write(conn)
-	}
-	if tf != nil {
-		tf.Close()
-	}
-}
-
-func (b *Broker) handleCreateTrensferer(e CreateTransfererEvent) {
-	var result Result
-	defer func() {
-		e.ResultCh <- result
-		close(e.ResultCh)
-	}()
-
+func (b *Broker) eh_CreateTransferer(e BrokerEvCreateTransferer) {
 	route, ok := b.route[e.Host]
 	if !ok {
-		result.Err = HttpError{404, "Not Found", "no route record for this host"}
+		e.future.Reject(HErrNoRouteRecort)
 		return
 	}
+
 	agent, ok := b.agents[route.AgentID]
 	if !ok {
-		result.Err = HttpError{503, "Agent Offline", "agent for this host is offline"}
+		e.future.Reject(HErrAgentNotOnline)
 		return
 	}
 
 	tid := strconv.FormatUint(agent.gentid(), 10)
-	tf := NewTransferer(tid, agent.ID, route.Host)
-	tf.wch = b.events.Send
+	tf := Transferer{
+		Request:  NewBlockedBuffer(),
+		Response: NewBlockedBuffer(),
+	}
 	agent.tfs[tid] = tf
-	result.Val = tf
+	e.future.Resolve(&tf)
+
+	go func() {
+		buf := make([]byte, 16*1024)
+		for serial := 0; ; serial++ {
+			n, err := tf.Request.Read(buf)
+			if err != nil {
+				tf.Request.SetError(err)
+				break
+			}
+			agent.SendMessage(DataMessage{
+				Serial: serial,
+				TID:    tid,
+				Host:   route.Host,
+				Data:   buf[:n],
+			})
+		}
+	}()
 }
 
-func (b *Broker) CreateTransferer(host string) (tf io.ReadWriteCloser, err error) {
-	retch := make(chan Result)
-	b.events.CreateTransferer <- CreateTransfererEvent{host, retch}
-	result := <-retch
-	if result.Err == nil {
-		tf = result.Val.(io.ReadWriteCloser)
-	} else {
-		err = result.Err
-	}
-	return
-}
-
-type Transferer struct {
-	id       string
-	host     string
-	agentID  string
-	wch      chan BrokerSendMsgEvent
-	rch      chan []byte
-	lastRead []byte
-
-	OnClose func(id string)
-}
-
-func NewTransferer(id, agentID, host string) *Transferer {
-	return &Transferer{
-		id:      id,
-		host:    host,
-		agentID: agentID,
-		rch:     make(chan []byte),
+func (b *Broker) acceptHTTPRequest(lsn net.Listener) {
+	for {
+		conn, err := lsn.Accept()
+		if err != nil {
+			break
+		}
+		go b.handleHTTPRequest(conn)
 	}
 }
 
-func (t *Transferer) Write(p []byte) (n int, err error) {
-	data := make([]byte, len(p))
-	n = copy(data, p)
-	msg := Message{
-		Type: MsgData,
-		Data: data,
-		Attr: map[string]string{
-			"tid":  t.id,
-			"host": t.host,
-		},
-	}
-	t.wch <- BrokerSendMsgEvent{t.agentID, msg}
-	return
-}
+func (b *Broker) handleHTTPRequest(conn net.Conn) {
+	var respReader *bufio.Reader
+	var tf *Transferer
+	var req *http.Request
+	var resp *http.Response
+	var err error
+	reqReader := bufio.NewReader(conn)
 
-func (r *Transferer) Read(p []byte) (n int, err error) {
-	var data []byte
-	if r.lastRead == nil {
-		var ok bool
-		if data, ok = <-r.rch; !ok {
-			err = io.EOF
+	defer func() {
+		if he, ok := err.(HTTPError); ok {
+			he.Write(bufio.NewWriter(conn))
+		}
+		conn.Close()
+	}()
+
+	for {
+		req, err = http.ReadRequest(reqReader)
+		if err != nil {
 			return
 		}
-	} else {
-		data = r.lastRead
-		r.lastRead = nil
+
+		if tf == nil {
+			tf, err = b.CreateTransferer(req.Host)
+			if err != nil {
+				return
+			}
+			respReader = bufio.NewReader(tf.Response)
+		}
+
+		req.Write(tf.Request)
+		resp, err = http.ReadResponse(respReader, req)
+		if err != nil {
+			return
+		}
+		resp.Write(conn)
+
+		if resp.Close {
+			return
+		}
 	}
-	if len(data) > len(p) {
-		r.lastRead = data[len(p):]
+
+}
+
+func (b *Broker) CreateTransferer(host string) (tf *Transferer, err error) {
+	future := NewFuture()
+	b.ev.CreateTransferer <- BrokerEvCreateTransferer{
+		Host:   host,
+		future: future,
 	}
-	n = copy(p, data)
+	val, err := future.Result()
+	if err == nil {
+		tf = val.(*Transferer)
+	}
 	return
 }
 
-func (t *Transferer) Close() error {
-	msg := Message{
-		Type: MsgData,
-		Attr: map[string]string{
-			"tid":   t.id,
-			"close": "EOF",
-		},
+func (b *Broker) acceptAgent(lsn net.Listener) {
+	for {
+		conn, err := lsn.Accept()
+		if err != nil {
+			break
+		}
+		agent := &Agent{
+			conn: conn,
+			msgr: NewMessageReader(conn),
+			tfs:  make(map[string]Transferer),
+		}
+		go b.auth(agent)
 	}
-	t.wch <- BrokerSendMsgEvent{t.agentID, msg}
-	if t.OnClose != nil {
-		t.OnClose(t.id)
-	}
-	return nil
 }

@@ -3,6 +3,7 @@ module github.com/sdjdd/hrt
 go 1.13
 
 require (
+	github.com/spf13/cobra v0.0.5
 	github.com/stretchr/objx v0.2.0 // indirect
 	github.com/stretchr/testify v1.4.0
 	go.uber.org/atomic v1.5.1 // indirect
