@@ -154,13 +154,13 @@ func (a *Agent) handleRecvMsg() {
 		case DataMessage:
 			log.Debugf("recv data msg, host=%s, tid=%s, data=%s", m.Host, m.TID, string(m.Data))
 			if m.Serial == 0 {
-				_, err := a.getLocalConn(m.Host, m.TID)
+				conn, err := a.getLocalConn(m.Host, m.TID)
 				if err != nil {
 					log.Errorf("get local connection: %s", err)
 					a.SendMessage(CloseMessage{TID: m.TID, Reason: "EOF"})
 					continue
 				}
-
+				conn.Write(m.Data)
 			}
 
 		default:

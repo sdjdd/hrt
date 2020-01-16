@@ -253,6 +253,9 @@ func (b *Broker) handleHTTPRequest(conn net.Conn) {
 			respReader = bufio.NewReader(tf.Response)
 		}
 
+		// FIXME: race condition
+		req.Host = b.route[req.Host].Host
+
 		req.Write(tf.Request)
 		resp, err = http.ReadResponse(respReader, req)
 		if err != nil {
