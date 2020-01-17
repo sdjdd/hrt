@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"unsafe"
 )
 
 type Transferable interface {
@@ -15,7 +16,7 @@ type Transferable interface {
 
 type (
 	AuthMessage struct {
-		Token, ID string
+		ID, Token string
 	}
 	TextMessage struct {
 		Content string
@@ -24,14 +25,16 @@ type (
 		Content string
 	}
 	DataMessage struct {
-		Serial int
-		TID    string
-		Host   string
-		Data   []byte
+		TID  string
+		Data []byte
 	}
-	CloseMessage struct {
-		TID    string
-		Reason string
+	FirstDataMessage struct {
+		DataMessage
+		Host string
+	}
+	LastDataMessage struct {
+		DataMessage
+		Err string
 	}
 )
 
@@ -39,19 +42,20 @@ type MessageReader struct {
 	rd *bufio.Reader
 }
 
-var ErrInvalidMessage = errors.New("unknown message type")
+var ErrInvalidMessage = errors.New("invalid message format")
 
 func NewMessageReader(rd io.Reader) *MessageReader {
-	return &MessageReader{
-		rd: bufio.NewReader(rd),
-	}
+	return &MessageReader{rd: bufio.NewReader(rd)}
 }
 
-func (r *MessageReader) Read() (msg Transferable, err error) {
+func str(p []byte) string { return *(*string)(unsafe.Pointer(&p)) }
+
+func (r *MessageReader) Read() (Transferable, error) {
 	firstch, err := r.rd.ReadByte()
 	if err != nil {
-		return
+		return nil, err
 	}
+
 	switch firstch {
 	case '@':
 		line, err := r.rd.ReadBytes('\n')
@@ -62,65 +66,51 @@ func (r *MessageReader) Read() (msg Transferable, err error) {
 		if len(sp) != 2 {
 			return nil, ErrInvalidMessage
 		}
-		return AuthMessage{
-			Token: string(sp[0]),
-			ID:    string(sp[1]),
-		}, nil
+		return AuthMessage{ID: str(sp[0]), Token: str(sp[1])}, nil
 
 	case '+':
 		text, err := r.rd.ReadBytes('\n')
 		if err != nil {
 			return nil, err
 		}
-		return TextMessage{Content: string(text[:len(text)-1])}, nil
+		return TextMessage{Content: str(text[:len(text)-1])}, nil
 
 	case '-':
 		text, err := r.rd.ReadBytes('\n')
 		if err != nil {
 			return nil, err
 		}
-		return ErrorMessage{Content: string(text[:len(text)-1])}, nil
+		return ErrorMessage{Content: str(text[:len(text)-1])}, nil
 
 	case '=':
-		line, err := r.rd.ReadBytes('\n')
+		return r.readDataMessage()
+
+	case '[':
+		host, err := r.rd.ReadBytes('\n')
 		if err != nil {
 			return nil, err
 		}
-		sp := bytes.Split(line[:len(line)-1], []byte{' '})
-		if len(sp) < 4 {
-			return nil, ErrInvalidMessage
-		}
-		serial, err := strconv.Atoi(string(sp[0]))
+		dm, err := r.readDataMessage()
 		if err != nil {
-			return nil, ErrInvalidMessage
-		}
-		dlenn, err := strconv.Atoi(string(sp[2]))
-		if err != nil {
-			return nil, fmt.Errorf("parse len(data) of data message: %s", err)
-		}
-		data := make([]byte, dlenn)
-		if _, err := io.ReadFull(r.rd, data); err != nil {
 			return nil, err
 		}
-		return DataMessage{
-			Serial: serial,
-			TID:    string(sp[1]),
-			Host:   string(bytes.Join(sp[3:], nil)),
-			Data:   data,
+		return FirstDataMessage{
+			Host:        str(host[:len(host)-1]),
+			DataMessage: dm,
 		}, nil
 
-	case '~':
-		tid, err := r.rd.ReadBytes(' ')
+	case ']':
+		errstr, err := r.rd.ReadBytes('\n')
 		if err != nil {
 			return nil, err
 		}
-		reason, err := r.rd.ReadBytes('\n')
+		dm, err := r.readDataMessage()
 		if err != nil {
 			return nil, err
 		}
-		return CloseMessage{
-			TID:    string(tid[:len(tid)-1]),
-			Reason: string(reason[:len(reason)-1]),
+		return LastDataMessage{
+			Err:         str(errstr[:len(errstr)-1]),
+			DataMessage: dm,
 		}, nil
 
 	default:
@@ -128,16 +118,50 @@ func (r *MessageReader) Read() (msg Transferable, err error) {
 	}
 }
 
+func (r *MessageReader) readDataMessage() (m DataMessage, err error) {
+	line, err := r.rd.ReadBytes('\n')
+	if err != nil {
+		return
+	}
+	sp := bytes.Split(line[:len(line)-1], []byte{' '})
+	if len(sp) != 2 {
+		err = ErrInvalidMessage
+		return
+	}
+	m.TID = str(sp[0])
+	dlenn, err := strconv.Atoi(str(sp[1]))
+	if err != nil {
+		err = fmt.Errorf("parse len(data) of data message: %s", err)
+		return
+	}
+	if dlenn > 0 {
+		m.Data = make([]byte, dlenn)
+		_, err = io.ReadFull(r.rd, m.Data)
+		if err != nil {
+			return
+		}
+	}
+	return
+}
+
+// '@' agent-id SP token LF
 func (m AuthMessage) Bytes() []byte {
-	bytes := make([]byte, len(m.Token)+len(m.ID)+3)
-	bytes[0] = '@'
-	copy(bytes[1:], m.Token)
-	bytes[len(m.Token)+1] = ' '
-	copy(bytes[len(m.Token)+2:], m.ID)
-	bytes[len(bytes)-1] = '\n'
+	bytes := make([]byte, len(m.ID)+len(m.Token)+3)
+	var n int
+
+	bytes[n] = '@'
+	n++
+
+	n += copy(bytes[n:], m.ID)
+	bytes[n] = ' '
+	n++
+
+	n += copy(bytes[n:], m.Token)
+	bytes[n] = '\n'
 	return bytes
 }
 
+// '+' text LF
 func (m TextMessage) Bytes() []byte {
 	bytes := make([]byte, len(m.Content)+2)
 	bytes[0] = '+'
@@ -146,18 +170,22 @@ func (m TextMessage) Bytes() []byte {
 	return bytes
 }
 
-// '=' serial SP tid SP data-length SP host LF data
+// '-' error LF
+func (m ErrorMessage) Bytes() []byte {
+	bytes := make([]byte, len(m.Content)+2)
+	bytes[0] = '-'
+	copy(bytes[1:], m.Content)
+	bytes[len(bytes)-1] = '\n'
+	return bytes
+}
+
+// '=' tid SP data-length LF data
 func (m DataMessage) Bytes() []byte {
-	serial := strconv.Itoa(m.Serial)
 	dlen := strconv.Itoa(len(m.Data))
-	bytes := make([]byte, len(serial)+len(m.TID)+len(dlen)+len(m.Host)+len(m.Data)+5)
+	bytes := make([]byte, len(m.TID)+len(dlen)+len(m.Data)+3)
 	var i int
 
 	bytes[i] = '='
-	i++
-
-	i += copy(bytes[i:], serial)
-	bytes[i] = ' '
 	i++
 
 	i += copy(bytes[i:], m.TID)
@@ -165,30 +193,59 @@ func (m DataMessage) Bytes() []byte {
 	i++
 
 	i += copy(bytes[i:], dlen)
-	bytes[i] = ' '
+	bytes[i] = '\n'
+	i++
+
+	copy(bytes[i:], m.Data)
+	return bytes
+}
+
+// '[' host LF tid SP data-length LF data
+func (m FirstDataMessage) Bytes() []byte {
+	dlen := strconv.Itoa(len(m.Data))
+	bytes := make([]byte, len(m.Host)+len(m.TID)+len(dlen)+len(m.Data)+4)
+	var i int
+
+	bytes[i] = '['
 	i++
 
 	i += copy(bytes[i:], m.Host)
 	bytes[i] = '\n'
 	i++
+
+	i += copy(bytes[i:], m.TID)
+	bytes[i] = ' '
+	i++
+
+	i += copy(bytes[i:], dlen)
+	bytes[i] = '\n'
+	i++
+
 	copy(bytes[i:], m.Data)
 	return bytes
 }
 
-func (m CloseMessage) Bytes() []byte {
-	bytes := make([]byte, len(m.TID)+len(m.Reason)+3)
-	bytes[0] = '~'
-	copy(bytes[1:], m.TID)
-	bytes[len(m.TID)+1] = ' '
-	copy(bytes[len(m.TID)+2:], m.Reason)
-	bytes[len(bytes)-1] = '\n'
-	return bytes
-}
+// ']' error LF tid SP data-length LF data
+func (m LastDataMessage) Bytes() []byte {
+	dlen := strconv.Itoa(len(m.Data))
+	bytes := make([]byte, len(m.Err)+len(m.TID)+len(dlen)+len(m.Data)+4)
+	var i int
 
-func (m ErrorMessage) Bytes() []byte {
-	bytes := make([]byte, len(m.Content)+2)
-	bytes[0] = '-'
-	copy(bytes[1:], m.Content)
-	bytes[len(bytes)-1] = '\n'
+	bytes[i] = ']'
+	i++
+
+	i += copy(bytes[i:], m.Err)
+	bytes[i] = '\n'
+	i++
+
+	i += copy(bytes[i:], m.TID)
+	bytes[i] = ' '
+	i++
+
+	i += copy(bytes[i:], dlen)
+	bytes[i] = '\n'
+	i++
+
+	copy(bytes[i:], m.Data)
 	return bytes
 }

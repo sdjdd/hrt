@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -88,6 +89,20 @@ func (b *Broker) Serve(addr, httpAddr string) (err error) {
 	}
 }
 
+func (b *Broker) acceptAgent(lsn net.Listener) {
+	for {
+		conn, err := lsn.Accept()
+		if err != nil {
+			break
+		}
+		agent := &Agent{
+			conn: conn,
+			msgr: NewMessageReader(conn),
+		}
+		go b.auth(agent)
+	}
+}
+
 func (b *Broker) auth(agent *Agent) {
 	var err error
 	defer func() {
@@ -126,30 +141,30 @@ func (b *Broker) auth(agent *Agent) {
 }
 
 func (b *Broker) recvAgentMessage(agent *Agent) {
+	defer func() {
+		b.ev.AgentOffline <- agent
+	}()
 	for {
 		msg, err := agent.ReadMessage(0)
 		if err != nil {
-			break
+			log.Errorf("read message from %s: %s", agent, err)
+			return
 		}
-
 		switch m := msg.(type) {
 		case DataMessage:
 			b.ev.DispatchResponse <- BEvDispatchMessage{
-				Agent: agent,
 				Msg:   m,
+				Agent: agent,
 			}
 		case TextMessage:
 			log.Debugf("text message from %s: %s", agent, m.Content)
 		case ErrorMessage:
 			log.Debugf("error message from %s: %s", agent, m.Content)
-		case CloseMessage:
-			log.Debugf("transferer %s closed: %s", m.TID, m.Reason)
 		default:
-			log.Infof("received a unknown message from %s", agent)
+			log.Infof("received an unsupported message from %s", agent)
+			return
 		}
 	}
-
-	b.ev.AgentOffline <- agent
 }
 
 func (b *Broker) eh_AgentOnline(agent *Agent) {
@@ -160,6 +175,7 @@ func (b *Broker) eh_AgentOnline(agent *Agent) {
 
 func (b *Broker) eh_AgentOffline(agent *Agent) {
 	log.Infof("agent %s offline", agent)
+	agent.conn.Close()
 	delete(b.agents, agent.ID)
 }
 
@@ -188,7 +204,7 @@ func (b *Broker) eh_CreateTransferer(e BrokerEvCreateTransferer) {
 		return
 	}
 
-	tid := strconv.FormatUint(agent.gentid(), 10)
+	tid := strconv.FormatUint(114514, 10)
 	tf := Transferer{
 		Request:  NewBlockedBuffer(),
 		Response: NewBlockedBuffer(),
@@ -205,10 +221,8 @@ func (b *Broker) eh_CreateTransferer(e BrokerEvCreateTransferer) {
 				break
 			}
 			agent.SendMessage(DataMessage{
-				Serial: serial,
-				TID:    tid,
-				Host:   route.Host,
-				Data:   buf[:n],
+				TID:  tid,
+				Data: buf[:n],
 			})
 		}
 	}()
@@ -225,8 +239,8 @@ func (b *Broker) acceptHTTPRequest(lsn net.Listener) {
 }
 
 func (b *Broker) handleHTTPRequest(conn net.Conn) {
+	var tunnel io.ReadWriteCloser
 	var respReader *bufio.Reader
-	var tf *Transferer
 	var req *http.Request
 	var resp *http.Response
 	var err error
@@ -239,35 +253,29 @@ func (b *Broker) handleHTTPRequest(conn net.Conn) {
 		conn.Close()
 	}()
 
+	req, err = http.ReadRequest(reqReader)
+	if err != nil {
+		return
+	}
+
 	for {
-		req, err = http.ReadRequest(reqReader)
-		if err != nil {
-			return
-		}
-
-		if tf == nil {
-			tf, err = b.CreateTransferer(req.Host)
-			if err != nil {
-				return
-			}
-			respReader = bufio.NewReader(tf.Response)
-		}
-
 		// FIXME: race condition
 		req.Host = b.route[req.Host].Host
 
-		req.Write(tf.Request)
+		req.Write(tunnel)
 		resp, err = http.ReadResponse(respReader, req)
 		if err != nil {
-			return
+			break
 		}
 		resp.Write(conn)
 
-		if resp.Close {
-			return
+		req, err = http.ReadRequest(reqReader)
+		if err != nil {
+			break
 		}
 	}
 
+	tunnel.Close()
 }
 
 func (b *Broker) CreateTransferer(host string) (tf *Transferer, err error) {
@@ -281,19 +289,4 @@ func (b *Broker) CreateTransferer(host string) (tf *Transferer, err error) {
 		tf = val.(*Transferer)
 	}
 	return
-}
-
-func (b *Broker) acceptAgent(lsn net.Listener) {
-	for {
-		conn, err := lsn.Accept()
-		if err != nil {
-			break
-		}
-		agent := &Agent{
-			conn: conn,
-			msgr: NewMessageReader(conn),
-			tfs:  make(map[string]Transferer),
-		}
-		go b.auth(agent)
-	}
 }

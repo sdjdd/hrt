@@ -4,18 +4,21 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"sync/atomic"
 	"time"
 )
 
 type Agent struct {
-	ID      string
-	conn    net.Conn
-	ev      AgentEvent
-	tfs     map[string]Transferer
-	lcons   map[string]net.Conn
-	msgr    *MessageReader
-	nextTID uint64
+	conn net.Conn
+	msgr *MessageReader
+
+	ev    AgentEvent
+	tfs   map[string]Transferer
+	lcons map[string]net.Conn
+
+	ID string
+}
+
+type tunnelInfo struct {
 }
 
 type AgentEvent struct {
@@ -69,10 +72,6 @@ func (a Agent) String() string {
 	return id + "@" + a.conn.RemoteAddr().String()
 }
 
-func (a *Agent) gentid() uint64 {
-	return atomic.AddUint64(&a.nextTID, 1)
-}
-
 func (a *Agent) Connect(addr, token string) (err error) {
 	if a.conn, err = net.Dial("tcp", addr); err != nil {
 		return
@@ -85,37 +84,23 @@ func (a *Agent) Connect(addr, token string) (err error) {
 	}
 
 	log.Info("connect to broker successfully")
-	go a.handleRecvMsg()
 
+	var msg Transferable
 	for {
-		select {
-		case e := <-a.ev.GetLocalConn:
-			a.eh_GetLocalConn(e)
+		msg, err = a.ReadMessage(0)
+		if err != nil {
+			break
+		}
+		switch m := msg.(type) {
+		case TextMessage:
+			log.Info("message from broker: ", m.Content)
 
-			// case m := <-a.ev.DispatchRequest:
-			// 	var tf Transferer
-			// 	if m.Serial == 0 {
-			// 		tf = NewTransferer()
-			// 		a.tfs[m.TID] = tf
-			// 		go func() {
-			// 			tf.
-			// 		}()
-			// 	} else {
-			// 		var ok bool
-			// 		tf, ok = a.tfs[m.TID]
-			// 		if !ok {
-			// 			a.SendMessage(CloseMessage{
-			// 				TID:    m.TID,
-			// 				Reason: "EOF",
-			// 			})
-			// 			continue
-			// 		}
-			// 	}
-			// 	tf.Request.Write(m.Data)
+		default:
+
 		}
 	}
 
-	return nil
+	return
 }
 
 func (a *Agent) auth(token string) error {
@@ -139,34 +124,6 @@ func (a *Agent) auth(token string) error {
 	}
 
 	return nil
-}
-
-func (a *Agent) handleRecvMsg() {
-	for {
-		msg, err := a.ReadMessage(0)
-		if err != nil {
-			break
-		}
-		switch m := msg.(type) {
-		case TextMessage:
-			log.Info("message from broker: ", m.Content)
-
-		case DataMessage:
-			log.Debugf("recv data msg, host=%s, tid=%s, data=%s", m.Host, m.TID, string(m.Data))
-			if m.Serial == 0 {
-				conn, err := a.getLocalConn(m.Host, m.TID)
-				if err != nil {
-					log.Errorf("get local connection: %s", err)
-					a.SendMessage(CloseMessage{TID: m.TID, Reason: "EOF"})
-					continue
-				}
-				conn.Write(m.Data)
-			}
-
-		default:
-
-		}
-	}
 }
 
 func (a *Agent) getLocalConn(host, tid string) (conn net.Conn, err error) {
@@ -208,20 +165,12 @@ func (a *Agent) eh_GetLocalConn(e AE_GetLocalConn) {
 	go func() {
 		buf := make([]byte, 16*1024)
 		for serial := 0; ; serial++ {
-			n, err := conn.Read(buf)
+			_, err := conn.Read(buf)
 			if err != nil {
 				log.Error("read data from local connection: ", err)
 				break
 			}
-
-			a.SendMessage(DataMessage{
-				Serial: serial,
-				TID:    e.TID,
-				Host:   e.Host,
-				Data:   buf[:n],
-			})
 		}
-		a.SendMessage(CloseMessage{TID: e.TID, Reason: "EOF"})
 		a.ev.CloseLocalConn <- AE_CloseLocalConn{TID: e.TID, Host: e.Host}
 	}()
 }

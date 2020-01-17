@@ -10,10 +10,10 @@ import (
 
 func TestEncodeAuthMessage(t *testing.T) {
 	m := AuthMessage{
-		Token: "test-token",
 		ID:    "test-ID",
+		Token: "test-token",
 	}
-	bytes := []byte("@" + m.Token + " " + m.ID + "\n")
+	bytes := []byte("@" + m.ID + " " + m.Token + "\n")
 	assert.Equal(t, bytes, m.Bytes())
 }
 
@@ -23,26 +23,29 @@ func TestEncodeTextMessage(t *testing.T) {
 	assert.Equal(t, bytes, m.Bytes())
 }
 
-func TestEncodeDataMessage(t *testing.T) {
-	m := DataMessage{
-		Serial: 114514,
-		TID:    "test-tid",
-		Host:   "test-host",
-		Data:   []byte("test-data"),
-	}
-	bytes := []byte(fmt.Sprintf("=%d %s %d %s\n%s",
-		m.Serial, m.TID, len(m.Data), m.Host, m.Data))
-	assert.Equal(t, bytes, m.Bytes())
-}
-
 func TestEncodeErrorMessage(t *testing.T) {
 	m := ErrorMessage{Content: "something bad!"}
 	assert.Equal(t, []byte("-"+m.Content+"\n"), m.Bytes())
 }
 
-func TestEncodeCloseMessage(t *testing.T) {
-	m := CloseMessage{TID: "test-tid", Reason: "EOF"}
-	bytes := []byte("~" + m.TID + " " + m.Reason + "\n")
+func TestEncodeDataMessage(t *testing.T) {
+	m := DataMessage{
+		TID:  "test-tid",
+		Data: []byte("test-data"),
+	}
+	bytes := []byte(fmt.Sprintf("=%s %d\n%s", m.TID, len(m.Data), m.Data))
+	assert.Equal(t, bytes, m.Bytes())
+}
+
+func TestEncodeFirstDataMessage(t *testing.T) {
+	m := FirstDataMessage{
+		Host: "114.51.41.191",
+		DataMessage: DataMessage{
+			TID:  "test-tid",
+			Data: []byte("sodayo!"),
+		},
+	}
+	bytes := []byte(fmt.Sprintf("[%s\n%s %d\n%s", m.Host, m.TID, len(m.Data), m.Data))
 	assert.Equal(t, bytes, m.Bytes())
 }
 
@@ -72,10 +75,8 @@ func TestParseErrorMessage(t *testing.T) {
 
 func TestParseDataMessage(t *testing.T) {
 	msg := DataMessage{
-		Serial: 114514,
-		TID:    "test-tid",
-		Host:   "http://example.com",
-		Data:   []byte{114, 5, 14, 191, 98, 10},
+		TID:  "test-tid",
+		Data: []byte{114, 5, 14, 191, 98, 10},
 	}
 	r := NewMessageReader(bytes.NewReader(msg.Bytes()))
 	msg2, err := r.Read()
@@ -83,10 +84,18 @@ func TestParseDataMessage(t *testing.T) {
 	assert.Equal(t, msg, msg2)
 }
 
-func TestParseCloseMessage(t *testing.T) {
-	msg := CloseMessage{TID: "test-tid", Reason: "i'd like to"}
+func TestReadFirstDataMessage(t *testing.T) {
+	assert := assert.New(t)
+	msg := FirstDataMessage{
+		Host: "www.114514.com",
+		DataMessage: DataMessage{
+			TID:  "test-tid",
+			Data: []byte{114, 5, 14, 191, 98, 10},
+		},
+	}
 	r := NewMessageReader(bytes.NewReader(msg.Bytes()))
 	msg2, err := r.Read()
-	assert.Nil(t, err)
-	assert.Equal(t, msg, msg2)
+	assert.Nil(err)
+	assert.IsType(FirstDataMessage{}, msg2)
+	assert.Equal(msg, msg2)
 }

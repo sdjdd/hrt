@@ -10,7 +10,10 @@ var (
 	HErrNoRouteRecort  = HTTPError{404, "Not Found", "no such route record"}
 )
 
-const httpErrorTmpl = `hrt error: %s`
+const httpErrorTmpl = `<!DOCTYPE html><html><head><title>hrt error</title></head><body>
+<h1>hrt error</h1>
+<p>%s</p>
+</body></html>`
 
 type HTTPError struct {
 	Status  int
